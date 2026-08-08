@@ -64,7 +64,8 @@ def summarize(group: str, rows: list[dict[str, str]]) -> dict[str, object]:
     case_decode_p50 = [number(row, "decode_p50_ms") for row in decoded_rows]
     case_decode_p95 = [number(row, "decode_p95_ms") for row in decoded_rows]
     decode_missing = sum(number(row, "decode_missing_experts") for row in rows)
-    decode_wait_ms = sum(number(row, "decode_missing_wait_ms") for row in rows)
+    decode_load_ms = sum(number(row, "decode_missing_load_ms") for row in rows)
+    decode_wait_ms = sum(number(row, "decode_resident_wait_ms") for row in rows)
     detailed = any(number(row, "detailed_timing") != 0 for row in rows)
 
     return {
@@ -85,7 +86,9 @@ def summarize(group: str, rows: list[dict[str, str]]) -> dict[str, object]:
         "decode_pread_mib": sum(number(row, "decode_pread_mib") for row in rows),
         "decode_missing_experts_per_step":
             ratio(decode_missing, decode_steps) if detailed else "",
-        "decode_missing_wait_ms_per_step":
+        "decode_missing_load_ms_per_step":
+            ratio(decode_load_ms, decode_steps) if detailed else "",
+        "decode_resident_wait_ms_per_step":
             ratio(decode_wait_ms, decode_steps) if detailed else "",
     }
 

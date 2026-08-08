@@ -166,6 +166,9 @@ typedef struct {
     uint64_t cache_resident_experts;
     uint64_t cache_missing_experts;
     double   selected_bind_ms;
+    /* Time finishing missing loads after resident work was submitted. */
+    double   missing_load_ms;
+    /* Time waiting for resident GPU work after missing loads finished. */
     double   missing_wait_ms;
     double   load_pread_ms;
     uint32_t resident_experts;

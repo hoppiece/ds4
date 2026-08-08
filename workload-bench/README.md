@@ -92,8 +92,8 @@ python3 workload-bench/summarize.py workload-warm.csv --group-by source
 
 For optimization diagnostics, an optional intrusive mode also records selected
 layer calls, all-resident/mixed/all-missing layers, resident and missing Expert
-references, bind time, SSD load time, and the synchronization wait on missing
-Experts:
+references, bind time, SSD load time remaining after resident submission, and
+the subsequent wait for the resident GPU stage:
 
 ```sh
 ./ds4-bench \

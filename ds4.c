@@ -57088,6 +57088,7 @@ bool ds4_engine_expert_cache_stats(ds4_engine *e,
     out->cache_resident_experts = gpu.cache_resident_experts;
     out->cache_missing_experts = gpu.cache_missing_experts;
     out->selected_bind_ms = gpu.selected_bind_ms;
+    out->missing_load_ms = gpu.missing_load_ms;
     out->missing_wait_ms = gpu.missing_wait_ms;
     out->load_pread_ms = gpu.load_pread_ms;
     out->resident_experts = gpu.resident_experts;

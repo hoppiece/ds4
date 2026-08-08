@@ -768,6 +768,8 @@ static ds4_expert_cache_stats bench_expert_stats_delta(
                             before.cache_missing_experts),
         .selected_bind_ms = bench_delta_f64(after.selected_bind_ms,
                                             before.selected_bind_ms),
+        .missing_load_ms = bench_delta_f64(after.missing_load_ms,
+                                           before.missing_load_ms),
         .missing_wait_ms = bench_delta_f64(after.missing_wait_ms,
                                            before.missing_wait_ms),
         .load_pread_ms = bench_delta_f64(after.load_pread_ms,
@@ -831,12 +833,14 @@ static int run_workload_benchmark(const bench_config *cfg, ds4_engine *engine) {
             "prefill_selected_calls,prefill_all_resident_layers,"
             "prefill_mixed_layers,prefill_all_missing_layers,"
             "prefill_resident_experts,prefill_missing_experts,"
-            "prefill_missing_experts_per_token,prefill_missing_wait_ms,"
+            "prefill_missing_experts_per_token,prefill_missing_load_ms,"
+            "prefill_resident_wait_ms,"
             "prefill_selected_bind_ms,prefill_load_pread_ms,"
             "decode_selected_calls,decode_all_resident_layers,"
             "decode_mixed_layers,decode_all_missing_layers,"
             "decode_resident_experts,decode_missing_experts,"
-            "decode_missing_experts_per_step,decode_missing_wait_ms,"
+            "decode_missing_experts_per_step,decode_missing_load_ms,"
+            "decode_resident_wait_ms,"
             "decode_selected_bind_ms,decode_load_pread_ms,"
             "resident_experts,cache_budget_experts\n");
     fflush(out);
@@ -1046,8 +1050,8 @@ static int run_workload_benchmark(const bench_config *cfg, ds4_engine *engine) {
                 (double)decode_delta.pread_bytes / (1024.0 * 1024.0),
                 decode_delta.pread_ms);
             fprintf(out,
-                "%d,%llu,%llu,%llu,%llu,%llu,%llu,%.6f,%.3f,%.3f,%.3f,"
-                "%llu,%llu,%llu,%llu,%llu,%llu,%.6f,%.3f,%.3f,%.3f,%u,%u\n",
+                "%d,%llu,%llu,%llu,%llu,%llu,%llu,%.6f,%.3f,%.3f,%.3f,%.3f,"
+                "%llu,%llu,%llu,%llu,%llu,%llu,%.6f,%.3f,%.3f,%.3f,%.3f,%u,%u\n",
                 cfg->workload_detailed_expert_timing ? 1 : 0,
                 (unsigned long long)prefill_delta.selected_calls,
                 (unsigned long long)prefill_delta.cache_all_resident_layers,
@@ -1058,6 +1062,7 @@ static int run_workload_benchmark(const bench_config *cfg, ds4_engine *engine) {
                 prompt.len > 0
                     ? (double)prefill_delta.cache_missing_experts / prompt.len
                     : 0.0,
+                prefill_delta.missing_load_ms,
                 prefill_delta.missing_wait_ms,
                 prefill_delta.selected_bind_ms,
                 prefill_delta.load_pread_ms,
@@ -1070,6 +1075,7 @@ static int run_workload_benchmark(const bench_config *cfg, ds4_engine *engine) {
                 decode_steps > 0
                     ? (double)decode_delta.cache_missing_experts / decode_steps
                     : 0.0,
+                decode_delta.missing_load_ms,
                 decode_delta.missing_wait_ms,
                 decode_delta.selected_bind_ms,
                 decode_delta.load_pread_ms,
@@ -1102,6 +1108,8 @@ static int run_workload_benchmark(const bench_config *cfg, ds4_engine *engine) {
                 prefill_delta.cache_missing_experts;
             total_prefill_stats.selected_bind_ms +=
                 prefill_delta.selected_bind_ms;
+            total_prefill_stats.missing_load_ms +=
+                prefill_delta.missing_load_ms;
             total_prefill_stats.missing_wait_ms +=
                 prefill_delta.missing_wait_ms;
             total_prefill_stats.load_pread_ms += prefill_delta.load_pread_ms;
@@ -1122,6 +1130,7 @@ static int run_workload_benchmark(const bench_config *cfg, ds4_engine *engine) {
             total_decode_stats.cache_missing_experts +=
                 decode_delta.cache_missing_experts;
             total_decode_stats.selected_bind_ms += decode_delta.selected_bind_ms;
+            total_decode_stats.missing_load_ms += decode_delta.missing_load_ms;
             total_decode_stats.missing_wait_ms += decode_delta.missing_wait_ms;
             total_decode_stats.load_pread_ms += decode_delta.load_pread_ms;
             completed++;
@@ -1163,16 +1172,20 @@ static int run_workload_benchmark(const bench_config *cfg, ds4_engine *engine) {
     if (cfg->workload_detailed_expert_timing) {
         fprintf(stderr,
                 "ds4-bench: detailed expert timing (intrusive) "
-                "prefill_missing_per_token=%.3f prefill_wait=%.3f ms "
-                "decode_missing_per_step=%.3f decode_wait=%.3f ms "
+                "prefill_missing_per_token=%.3f prefill_load=%.3f ms "
+                "prefill_resident_wait=%.3f ms "
+                "decode_missing_per_step=%.3f decode_load=%.3f ms "
+                "decode_resident_wait=%.3f ms "
                 "decode_bind=%.3f ms decode_load_pread=%.3f ms\n",
                 total_prompt_tokens > 0
                     ? (double)total_prefill_stats.cache_missing_experts /
                         (double)total_prompt_tokens : 0.0,
+                total_prefill_stats.missing_load_ms,
                 total_prefill_stats.missing_wait_ms,
                 total_decode_steps > 0
                     ? (double)total_decode_stats.cache_missing_experts /
                         (double)total_decode_steps : 0.0,
+                total_decode_stats.missing_load_ms,
                 total_decode_stats.missing_wait_ms,
                 total_decode_stats.selected_bind_ms,
                 total_decode_stats.load_pread_ms);

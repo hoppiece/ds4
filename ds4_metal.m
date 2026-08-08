@@ -10564,6 +10564,7 @@ void ds4_gpu_stream_expert_cache_get_stats(
         .cache_missing_experts =
             g_stream_expert_timing_cache_missing_experts,
         .selected_bind_ms = g_stream_expert_timing_selected_bind_ms,
+        .missing_load_ms = g_stream_expert_timing_split_missing_load_ms,
         .missing_wait_ms = g_stream_expert_timing_split_missing_wait_ms,
         .load_pread_ms = g_stream_expert_timing_load_pread_ms,
         .resident_experts = g_stream_expert_cache_entry_count,
