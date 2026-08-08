@@ -248,10 +248,53 @@ python3 workload-bench/simulate_expert_cache.py expert-route.csv \
   --policy current-layer-quota
 ```
 
+## Offline next-token prefetch ceiling
+
+`analyze_expert_prefetch.py` evaluates previous-token (top-1, top-2, and full),
+recent-frequency (top-1/top-2), online per-layer transition (top-1/top-2), and
+warmup-only static-hotlist (top-1/top-2) predictors:
+
+```sh
+python3 workload-bench/analyze_expert_prefetch.py expert-route.csv \
+  --capacity 1915 \
+  --warmup-requests 2 \
+  --format csv \
+  --require-gates
+```
+
+The input must be canonical trace-v1 CSV with CRLF record endings. Warmup
+requests update both the current cache replay and causal predictor state but do
+not contribute metrics; the static hotlist is frozen after warmup. A prediction
+is issued after its source decode row updates the replayed current policy.
+Experts resident at that instant are suppressed from speculative I/O and
+reported separately as `pin_only_misses` if they are absent at the next token.
+At that consecutive same-request/layer target, the trace `hit_mask`—not the
+simulated cache outcome—is authoritative for useful I/O and demand misses.
+
+Submitted-I/O precision, useful coverage of eligible misses, useful coverage
+of all measured decode misses (including first-token misses), and wasted bytes
+over all measured demand bytes are reported. The default acceptance gates are
+70% precision, 20% global coverage, and at most 15% waste. With
+`--require-gates`, exit status 1 means no configuration passed; malformed trace
+or configuration input returns 2. `--require-current-agreement-pp` optionally
+gates the absolute replay-versus-observed decode hit-rate difference.
+
+This analysis is deliberately optimistic: it assumes unbounded speculative
+slots and I/O bandwidth and does not model deadlines, cancellation, or demand
+interference. Even that ceiling fails on the balanced v1 trace. Transition
+top-1 reached 2.957% submitted-I/O precision, 0.159% global miss coverage, and
+5.216% wasted/demand bytes; top-2 reached 2.568%, 0.358%, and 13.572%.
+Previous-token full submitted no I/O and instead identified 463 pin-only misses
+out of 30,194 measured misses (1.53%). Current-policy replay was +0.6246
+percentage points above the observed decode hit rate. A bounded prefetch queue
+model is therefore deferred unless a stronger predictor raises this upper
+bound materially.
+
 Run the dependency-free focused tests with:
 
 ```sh
 python3 -m unittest discover -s tests -p 'test_simulate_expert_cache.py' -v
+python3 -m unittest discover -s tests -p 'test_analyze_expert_prefetch.py' -v
 ```
 
 For the lowest-risk smoke test, use a 16 GiB cache and only one generated token
