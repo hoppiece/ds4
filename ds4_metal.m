@@ -572,6 +572,17 @@ static uint64_t
 static uint64_t g_moe_selected_hotlist_records;
 static uint64_t g_moe_selected_hotlist_selections;
 
+static int g_stream_expert_route_trace_initialized;
+static int g_stream_expert_route_trace_write_failed;
+static FILE *g_stream_expert_route_trace_fp;
+static uint64_t g_stream_expert_route_trace_rows;
+static uint64_t g_stream_expert_route_trace_next_request;
+static uint64_t g_stream_expert_route_trace_request;
+static uint64_t
+    g_stream_expert_route_trace_next_token[3][DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
+static ds4_gpu_stream_expert_trace_phase g_stream_expert_route_trace_phase;
+static int g_stream_expert_route_trace_request_valid;
+
 typedef struct {
     __strong id<MTLBuffer> gate_buffer;
     __strong id<MTLBuffer> up_buffer;
@@ -1580,6 +1591,275 @@ static int ds4_gpu_moe_selected_trace_replay(
            g_moe_selected_trace_replay_ids + g_moe_selected_trace_replay_pos * n_selected,
            (size_t)n_selected * sizeof(selected_ids[0]));
     g_moe_selected_trace_replay_pos++;
+    return 1;
+}
+
+static const char *ds4_gpu_stream_expert_route_trace_path(void) {
+    const char *path = getenv("DS4_METAL_STREAMING_EXPERT_TRACE");
+    return path && path[0] ? path : NULL;
+}
+
+static void ds4_gpu_stream_expert_route_trace_close(void) {
+    if (!g_stream_expert_route_trace_fp) return;
+    const char *path = ds4_gpu_stream_expert_route_trace_path();
+    const int close_failed = fclose(g_stream_expert_route_trace_fp) != 0;
+    g_stream_expert_route_trace_fp = NULL;
+    if (close_failed) {
+        fprintf(stderr,
+                "ds4: failed to close Metal streaming Expert trace %s\n",
+                path ? path : "(unknown)");
+    } else {
+        fprintf(stderr,
+                "ds4: wrote %" PRIu64 " Metal streaming Expert trace rows to %s\n",
+                g_stream_expert_route_trace_rows,
+                path ? path : "(unknown)");
+    }
+}
+
+static int ds4_gpu_stream_expert_route_trace_init(void) {
+    if (g_stream_expert_route_trace_initialized) {
+        return g_stream_expert_route_trace_fp != NULL &&
+               !g_stream_expert_route_trace_write_failed;
+    }
+    const char *path = ds4_gpu_stream_expert_route_trace_path();
+    if (!path) return 1;
+
+    g_stream_expert_route_trace_initialized = 1;
+    g_stream_expert_route_trace_fp = fopen(path, "wb");
+    if (!g_stream_expert_route_trace_fp) {
+        fprintf(stderr,
+                "ds4: failed to open Metal streaming Expert trace %s: %s\n",
+                path,
+                strerror(errno));
+        return 0;
+    }
+    if (setvbuf(g_stream_expert_route_trace_fp,
+                NULL,
+                _IOFBF,
+                1u << 20) != 0) {
+        fprintf(stderr,
+                "ds4: failed to buffer Metal streaming Expert trace %s\n",
+                path);
+        fclose(g_stream_expert_route_trace_fp);
+        g_stream_expert_route_trace_fp = NULL;
+        return 0;
+    }
+
+    static const char header[] =
+        "trace_version,phase,request,token,layer,selected_ids,hit_mask,cache_size,expert_bytes\r\n";
+    if (fwrite(header,
+               1,
+               sizeof(header) - 1,
+               g_stream_expert_route_trace_fp) != sizeof(header) - 1) {
+        fprintf(stderr,
+                "ds4: failed to write Metal streaming Expert trace header %s\n",
+                path);
+        fclose(g_stream_expert_route_trace_fp);
+        g_stream_expert_route_trace_fp = NULL;
+        return 0;
+    }
+    atexit(ds4_gpu_stream_expert_route_trace_close);
+    return 1;
+}
+
+int ds4_gpu_stream_expert_trace_begin_request(void) {
+    if (!g_ssd_streaming_mode || !ds4_gpu_stream_expert_route_trace_path()) {
+        return 1;
+    }
+    if (!ds4_gpu_stream_expert_route_trace_init()) return 0;
+
+    g_stream_expert_route_trace_request =
+        g_stream_expert_route_trace_next_request;
+    if (g_stream_expert_route_trace_next_request != UINT64_MAX) {
+        g_stream_expert_route_trace_next_request++;
+    }
+    memset(g_stream_expert_route_trace_next_token,
+           0,
+           sizeof(g_stream_expert_route_trace_next_token));
+    g_stream_expert_route_trace_phase =
+        DS4_GPU_STREAM_EXPERT_TRACE_PHASE_PREFILL;
+    g_stream_expert_route_trace_request_valid = 1;
+    return 1;
+}
+
+void ds4_gpu_stream_expert_trace_set_phase(
+        ds4_gpu_stream_expert_trace_phase phase) {
+    if (phase != DS4_GPU_STREAM_EXPERT_TRACE_PHASE_PREFILL &&
+        phase != DS4_GPU_STREAM_EXPERT_TRACE_PHASE_DECODE) {
+        return;
+    }
+
+    if (!g_stream_expert_route_trace_request_valid) return;
+    g_stream_expert_route_trace_phase = phase;
+}
+
+static int ds4_gpu_stream_expert_route_trace_write_row(
+        uint64_t       token,
+        uint32_t       layer,
+        const int32_t *selected_ids,
+        uint32_t       n_selected,
+        uint32_t       hit_bits,
+        uint32_t       cache_size,
+        uint64_t       expert_bytes) {
+    if (!g_stream_expert_route_trace_request_valid) return 1;
+    if (!g_stream_expert_route_trace_fp ||
+        g_stream_expert_route_trace_write_failed) {
+        return 0;
+    }
+    if (!selected_ids || n_selected == 0 ||
+        n_selected > DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED) {
+        return 0;
+    }
+
+    const char *phase =
+        g_stream_expert_route_trace_phase ==
+                DS4_GPU_STREAM_EXPERT_TRACE_PHASE_PREFILL ?
+            "prefill" :
+        g_stream_expert_route_trace_phase ==
+                DS4_GPU_STREAM_EXPERT_TRACE_PHASE_DECODE ?
+            "decode" : NULL;
+    if (!phase) return 1;
+
+    char ids[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED * 12u];
+    char mask[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED + 1u];
+    size_t ids_len = 0;
+    for (uint32_t i = 0; i < n_selected; i++) {
+        const int n = snprintf(ids + ids_len,
+                               sizeof(ids) - ids_len,
+                               i == 0 ? "%d" : ";%d",
+                               selected_ids[i]);
+        if (n < 0 || (size_t)n >= sizeof(ids) - ids_len) return 0;
+        ids_len += (size_t)n;
+        mask[i] = (hit_bits & (1u << i)) != 0 ? '1' : '0';
+    }
+    mask[n_selected] = '\0';
+
+    char row[512];
+    const int row_len = snprintf(
+            row,
+            sizeof(row),
+            "1,%s,%" PRIu64 ",%" PRIu64 ",%u,%s,%s,%u,%" PRIu64 "\r\n",
+            phase,
+            g_stream_expert_route_trace_request,
+            token,
+            layer,
+            ids,
+            mask,
+            cache_size,
+            expert_bytes);
+    if (row_len < 0 || (size_t)row_len >= sizeof(row) ||
+        fwrite(row,
+               1,
+               (size_t)row_len,
+               g_stream_expert_route_trace_fp) != (size_t)row_len) {
+        if (!g_stream_expert_route_trace_write_failed) {
+            const char *path = ds4_gpu_stream_expert_route_trace_path();
+            fprintf(stderr,
+                    "ds4: failed to write Metal streaming Expert trace %s\n",
+                    path ? path : "(unknown)");
+        }
+        g_stream_expert_route_trace_write_failed = 1;
+        return 0;
+    }
+    g_stream_expert_route_trace_rows++;
+    return 1;
+}
+
+static int ds4_gpu_stream_expert_route_trace_claim_tokens(
+        uint32_t  layer,
+        uint32_t  n_tokens,
+        uint64_t *token_base) {
+    if (!g_stream_expert_route_trace_request_valid) return 1;
+    if (!token_base ||
+        layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER ||
+        n_tokens == 0 ||
+        g_stream_expert_route_trace_phase <
+            DS4_GPU_STREAM_EXPERT_TRACE_PHASE_PREFILL ||
+        g_stream_expert_route_trace_phase >
+            DS4_GPU_STREAM_EXPERT_TRACE_PHASE_DECODE) {
+        return 0;
+    }
+    /* Each routed layer claims the same contiguous token ordinals during the
+     * layer-major pass; keeping cursors per layer also handles skipped dense or
+     * fully resident layers without inspecting token contents. */
+    uint64_t *next =
+        &g_stream_expert_route_trace_next_token
+            [(uint32_t)g_stream_expert_route_trace_phase][layer];
+    if (*next > UINT64_MAX - n_tokens) return 0;
+    *token_base = *next;
+    *next += n_tokens;
+    return 1;
+}
+
+static int ds4_gpu_stream_expert_route_trace_record_selected(
+        uint32_t       layer,
+        const int32_t *selected_ids,
+        uint32_t       n_selected,
+        uint32_t       hit_bits,
+        uint32_t       cache_size,
+        uint64_t       expert_bytes) {
+    if (!g_stream_expert_route_trace_request_valid) return 1;
+    uint64_t token = 0;
+    if (!ds4_gpu_stream_expert_route_trace_claim_tokens(layer, 1, &token)) {
+        return 0;
+    }
+    return ds4_gpu_stream_expert_route_trace_write_row(token,
+                                                        layer,
+                                                        selected_ids,
+                                                        n_selected,
+                                                        hit_bits,
+                                                        cache_size,
+                                                        expert_bytes);
+}
+
+static int ds4_gpu_stream_expert_route_trace_record_batch(
+        uint32_t       layer,
+        const int32_t *selected_ids,
+        uint32_t       n_tokens,
+        uint32_t       n_selected,
+        const bool    *initial_hit,
+        uint32_t       cache_size,
+        uint64_t       expert_bytes) {
+    if (!g_stream_expert_route_trace_request_valid) return 1;
+    if (!selected_ids || !initial_hit || n_tokens == 0 ||
+        n_selected == 0 ||
+        n_selected > DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED) {
+        return 0;
+    }
+
+    uint64_t token_base = 0;
+    if (!ds4_gpu_stream_expert_route_trace_claim_tokens(layer,
+                                                         n_tokens,
+                                                         &token_base)) {
+        return 0;
+    }
+    bool seen[DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT] = { false };
+    for (uint32_t token = 0; token < n_tokens; token++) {
+        uint32_t hit_bits = 0;
+        const int32_t *token_ids = selected_ids + (uint64_t)token * n_selected;
+        for (uint32_t i = 0; i < n_selected; i++) {
+            const int32_t selected_id = token_ids[i];
+            if (selected_id < 0 ||
+                (uint32_t)selected_id >=
+                    DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT) {
+                return 0;
+            }
+            const uint32_t expert = (uint32_t)selected_id;
+            if (initial_hit[expert] || seen[expert]) {
+                hit_bits |= 1u << i;
+            }
+            seen[expert] = true;
+        }
+        if (!ds4_gpu_stream_expert_route_trace_write_row(token_base + token,
+                                                          layer,
+                                                          token_ids,
+                                                          n_selected,
+                                                          hit_bits,
+                                                          cache_size,
+                                                          expert_bytes)) {
+            return 0;
+        }
+    }
     return 1;
 }
 
@@ -15021,7 +15301,8 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
         n_total_expert == 0 ||
         n_total_expert > DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT ||
         gate_expert_bytes == 0 ||
-        down_expert_bytes == 0) {
+        down_expert_bytes == 0 ||
+        gate_expert_bytes > (UINT64_MAX - down_expert_bytes) / 2ull) {
         return 0;
     }
     if (n_tokens > UINT32_MAX / n_selected) return 0;
@@ -15041,6 +15322,7 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
     const double t_read = profile ? ds4_gpu_now_ms() : 0.0;
 
     bool seen[DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT] = { false };
+    bool trace_initial_hit[DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT] = { false };
     uint32_t frequency[DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT] = { 0 };
     int32_t unique_ids[DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
     uint32_t unique_count = 0;
@@ -15125,6 +15407,7 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
     double load_timing_t0 = ds4_gpu_stream_expert_timing_summary_enabled() ?
                             ds4_gpu_now_ms() : 0.0;
     const int load_timing = load_timing_t0 != 0.0;
+    const uint32_t trace_cache_size = g_stream_expert_cache_entry_count;
     if (ok && unique_count != 0) {
         tasks = calloc((size_t)unique_count * 3u, sizeof(tasks[0]));
         if (!tasks) ok = 0;
@@ -15169,6 +15452,7 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
                                                  gate_expert_bytes,
                                                  down_expert_bytes);
             if (entry) {
+                trace_initial_hit[expert] = true;
                 unique_entries[u] = entry;
                 continue;
             }
@@ -15326,6 +15610,16 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
                                                           load_modify_ms,
                                                           load_install_ms);
         }
+    }
+    if (ok && !ds4_gpu_stream_expert_route_trace_record_batch(
+                      layer,
+                      ids,
+                      n_tokens,
+                      n_selected,
+                      trace_initial_hit,
+                      trace_cache_size,
+                      gate_expert_bytes * 2ull + down_expert_bytes)) {
+        ok = 0;
     }
     if (tasks) free(tasks);
     if (ok) {
@@ -33665,6 +33959,16 @@ int ds4_gpu_glm_routed_moe_one_tensor(
                         stream_resident_mask |= 1u << i;
                     }
                 }
+                if (stream_ok &&
+                    !ds4_gpu_stream_expert_route_trace_record_selected(
+                            layer_index,
+                            stream_selected_ids,
+                            n_expert,
+                            stream_resident_mask,
+                            g_stream_expert_cache_entry_count,
+                            gate_expert_bytes * 2ull + down_expert_bytes)) {
+                    stream_ok = 0;
+                }
                 if (stream_ok && glm_stream_timing) {
                     ds4_gpu_stream_expert_timing_note_cache_class(
                             stream_resident_mask,
@@ -36742,6 +37046,16 @@ int ds4_gpu_routed_moe_one_tensor(
                         return 0;
                     }
                 }
+            }
+            if (use_stream_expert_cache && selected_ids_available &&
+                !ds4_gpu_stream_expert_route_trace_record_selected(
+                        layer_index,
+                        selected_ids,
+                        n_expert,
+                        stream_expert_resident_mask,
+                        g_stream_expert_cache_entry_count,
+                        gate_expert_bytes * 2ull + down_expert_bytes)) {
+                return 0;
             }
             if (use_stream_expert_cache) {
                 use_stream_expert_addr_table =

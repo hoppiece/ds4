@@ -215,6 +215,15 @@ int ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
  * wait on command buffers from that thread (they fail the load instead and
  * the caller retries synchronously). */
 void ds4_gpu_stream_expert_cache_note_service_thread(void);
+typedef enum {
+    DS4_GPU_STREAM_EXPERT_TRACE_PHASE_PREFILL = 1,
+    DS4_GPU_STREAM_EXPERT_TRACE_PHASE_DECODE = 2,
+} ds4_gpu_stream_expert_trace_phase;
+/* Intrusive Metal SSD-cache tracing is request-scoped.  Explicit phase hooks
+ * keep one-token checkpoint extension classified as prefill. */
+int ds4_gpu_stream_expert_trace_begin_request(void);
+void ds4_gpu_stream_expert_trace_set_phase(
+        ds4_gpu_stream_expert_trace_phase phase);
 #endif
 #if defined(DS4_ROCM_BUILD) || (!defined(DS4_NO_GPU) && !defined(__APPLE__))
 int ds4_gpu_stream_expert_cache_prepare_selected_batch(

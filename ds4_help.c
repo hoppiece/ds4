@@ -382,6 +382,7 @@ static void print_bench_specific(FILE *fp, const help_colors *c) {
     opt(fp, c, "--workload-warmup N", "Run N unreported records before a warm workload measurement.");
     opt(fp, c, "--workload-cold", "Clear the resident expert cache before every workload record.");
     opt(fp, c, "--workload-detailed-expert-timing", "Collect intrusive Metal missing-Expert and I/O-wait diagnostics.");
+    opt(fp, c, "--workload-expert-trace FILE", "Write a buffered, privacy-safe Metal SSD Expert route trace.");
     opt(fp, c, "--csv FILE", "Write CSV there instead of stdout.");
     opt(fp, c, "--dump-frontier-logits-dir DIR", "Write one full-logit JSON file per frontier.");
     fputc('\n', fp);

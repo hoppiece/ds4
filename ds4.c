@@ -58896,6 +58896,12 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
     ds4_engine *e = s->engine;
     const char *backend_name = ds4_backend_name(e->backend);
     (void)backend_name; (void)e;
+#if defined(__APPLE__)
+    if (!ds4_gpu_stream_expert_trace_begin_request()) {
+        snprintf(err, errlen, "Metal expert route trace initialization failed");
+        return 1;
+    }
+#endif
     if (ds4_session_is_glm(s)) {
         /* Debug: truncate the prompt so the dumped prefill logits line up
          * with the CPU first-token reference (DS4_GLM_LOGIT_DUMP). */
@@ -60489,6 +60495,10 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
     return 1;
 #else
     ds4_engine *e = s->engine;
+#if defined(__APPLE__)
+    ds4_gpu_stream_expert_trace_set_phase(
+            DS4_GPU_STREAM_EXPERT_TRACE_PHASE_DECODE);
+#endif
     if (ds4_session_is_glm(s)) {
         /* TP worker under GLM MTP: run the full speculative cycle off the
          * mirrored EVAL frame so drafts, verify batches, and gate traffic

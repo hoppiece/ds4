@@ -34,6 +34,7 @@ typedef struct {
     const char *system;
     const char *csv_path;
     const char *expert_profile_path;
+    const char *workload_expert_trace_path;
     const char *gpu_vram_arg;
     const char *gpu_devices_arg;
     ds4_backend backend;
@@ -409,6 +410,13 @@ static bench_config parse_options(int argc, char **argv) {
             c.workload_cold = true;
         } else if (!strcmp(arg, "--workload-detailed-expert-timing")) {
             c.workload_detailed_expert_timing = true;
+        } else if (!strcmp(arg, "--workload-expert-trace")) {
+            c.workload_expert_trace_path = need_arg(&i, argc, argv, arg);
+            if (c.workload_expert_trace_path[0] == '\0') {
+                fprintf(stderr,
+                        "ds4-bench: --workload-expert-trace requires a non-empty file path\n");
+                exit(2);
+            }
         } else if (!strcmp(arg, "--csv")) {
             c.csv_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dump-frontier-logits-dir")) {
@@ -515,6 +523,17 @@ static bench_config parse_options(int argc, char **argv) {
         (!c.ssd_streaming || c.backend != DS4_BACKEND_METAL)) {
         fprintf(stderr,
                 "ds4-bench: --workload-detailed-expert-timing requires Metal SSD streaming\n");
+        exit(2);
+    }
+    if (c.workload_expert_trace_path && !c.workload_path) {
+        fprintf(stderr,
+                "ds4-bench: --workload-expert-trace requires --workload-file\n");
+        exit(2);
+    }
+    if (c.workload_expert_trace_path &&
+        (!c.ssd_streaming || c.backend != DS4_BACKEND_METAL)) {
+        fprintf(stderr,
+                "ds4-bench: --workload-expert-trace requires Metal SSD streaming\n");
         exit(2);
     }
     if (c.ctx_start > c.ctx_max) {
@@ -1225,6 +1244,21 @@ int main(int argc, char **argv) {
             return 2;
         }
         cfg.backend = skip_cuda ? DS4_BACKEND_CPU : DS4_BACKEND_CUDA;
+    }
+    if (cfg.workload_expert_trace_path &&
+        (!cfg.ssd_streaming || cfg.backend != DS4_BACKEND_METAL)) {
+        fprintf(stderr,
+                "ds4-bench: --workload-expert-trace requires Metal SSD streaming\n");
+        return 2;
+    }
+    if (cfg.workload_expert_trace_path &&
+        setenv("DS4_METAL_STREAMING_EXPERT_TRACE",
+               cfg.workload_expert_trace_path,
+               1) != 0) {
+        fprintf(stderr,
+                "ds4-bench: failed to enable expert route tracing: %s\n",
+                strerror(errno));
+        return 2;
     }
 
     ds4_engine_options opt = {
