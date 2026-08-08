@@ -30525,6 +30525,16 @@ extern "C" uint32_t ds4_gpu_stream_expert_cache_current_count(void) {
         g_stream_selected_cache.compact_count : 0;
 }
 
+extern "C" void ds4_gpu_stream_expert_cache_get_stats(
+        ds4_gpu_stream_expert_stats *out) {
+    if (out) memset(out, 0, sizeof(*out));
+}
+
+extern "C" int ds4_gpu_stream_expert_cache_clear_for_benchmark(void) {
+    cuda_stream_selected_cache_release();
+    return 1;
+}
+
 extern "C" void ds4_gpu_stream_expert_cache_reset_route_hotness(void) {
 }
 

@@ -152,6 +152,31 @@ void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes);
 uint64_t ds4_gpu_recommended_working_set_size(void);
 uint32_t ds4_gpu_stream_expert_cache_configured_count(void);
 uint32_t ds4_gpu_stream_expert_cache_current_count(void);
+typedef struct {
+    uint64_t hits;
+    uint64_t misses;
+    uint64_t evictions;
+    uint64_t pread_bytes;
+    double   pread_ms;
+    /* Populated only when detailed streaming timing is enabled. */
+    uint64_t selected_calls;
+    uint64_t cache_all_resident_layers;
+    uint64_t cache_all_missing_layers;
+    uint64_t cache_mixed_layers;
+    uint64_t cache_resident_experts;
+    uint64_t cache_missing_experts;
+    double   selected_bind_ms;
+    double   missing_wait_ms;
+    double   load_pread_ms;
+    uint32_t resident_experts;
+    uint32_t budget_experts;
+} ds4_gpu_stream_expert_stats;
+/* Cheap monotonic counters for phase deltas in benchmarks. */
+void ds4_gpu_stream_expert_cache_get_stats(
+        ds4_gpu_stream_expert_stats *out);
+/* Diagnostic cold-cache boundary.  This releases resident expert slabs and
+ * resets counters; normal sessions intentionally keep the cache warm. */
+int ds4_gpu_stream_expert_cache_clear_for_benchmark(void);
 typedef struct ds4_gpu_stream_expert_table {
     const void *model_map;
     uint64_t    model_size;

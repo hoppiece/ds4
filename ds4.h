@@ -186,6 +186,26 @@ typedef struct {
 } ds4_context_memory;
 
 typedef struct {
+    uint64_t hits;
+    uint64_t misses;
+    uint64_t evictions;
+    uint64_t pread_bytes;
+    double   pread_ms;
+    /* Detailed fields remain zero unless benchmark timing is enabled. */
+    uint64_t selected_calls;
+    uint64_t cache_all_resident_layers;
+    uint64_t cache_all_missing_layers;
+    uint64_t cache_mixed_layers;
+    uint64_t cache_resident_experts;
+    uint64_t cache_missing_experts;
+    double   selected_bind_ms;
+    double   missing_wait_ms;
+    double   load_pread_ms;
+    uint32_t resident_experts;
+    uint32_t budget_experts;
+} ds4_expert_cache_stats;
+
+typedef struct {
     uint8_t *ptr;
     uint64_t len;
     uint64_t cap;
@@ -226,6 +246,12 @@ int ds4_engine_power(ds4_engine *e);
 int ds4_engine_set_power(ds4_engine *e, int power_percent);
 const char *ds4_engine_model_name(ds4_engine *e);
 int ds4_engine_layer_count(ds4_engine *e);
+/* Snapshot the SSD expert-cache counters.  Values are monotonic until a
+ * diagnostic cold-cache reset, so callers can take cheap phase deltas. */
+bool ds4_engine_expert_cache_stats(ds4_engine *e,
+                                   ds4_expert_cache_stats *out);
+/* Benchmark-only cold boundary.  Production sessions preserve the cache. */
+int ds4_engine_expert_cache_clear_for_benchmark(ds4_engine *e);
 /* Decode gate schedule for the TP transport; see ds4_tp_identity. */
 void ds4_engine_tp_gate_schedule(ds4_engine *e,
                                  uint32_t *start,

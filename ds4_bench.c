@@ -13,6 +13,7 @@
  * save/restore time is intentionally outside both timing windows.
  */
 
+#include <ctype.h>
 #include <errno.h>
 #include <limits.h>
 #include <math.h>
@@ -29,6 +30,7 @@ typedef struct {
     const char *model_path;
     const char *prompt_path;
     const char *chat_prompt_path;
+    const char *workload_path;
     const char *system;
     const char *csv_path;
     const char *expert_profile_path;
@@ -41,6 +43,8 @@ typedef struct {
     int ctx_alloc;
     int step_incr;
     int gen_tokens;
+    int workload_limit;
+    int workload_warmup;
     int power_percent;
     uint32_t prefill_chunk;
     uint32_t ssd_streaming_cache_experts;
@@ -58,7 +62,22 @@ typedef struct {
     bool ssd_streaming_full_layers_set;
     bool cuda_tensor_parallel;
     bool show_output;
+    bool workload_cold;
+    bool workload_detailed_expert_timing;
 } bench_config;
+
+typedef struct {
+    char *id;
+    char *category;
+    char *source;
+    char *rendered;
+} bench_workload_case;
+
+typedef struct {
+    bench_workload_case *v;
+    int len;
+    int cap;
+} bench_workload;
 
 static double bench_now_sec(void) {
     struct timespec ts;
@@ -197,6 +216,131 @@ static char *read_file(const char *path) {
     return buf;
 }
 
+static char *bench_strndup(const char *s, size_t n) {
+    char *out = malloc(n + 1);
+    if (!out) return NULL;
+    memcpy(out, s, n);
+    out[n] = '\0';
+    return out;
+}
+
+static char *bench_workload_marker(char *base, char *cursor) {
+    static const char marker[] = "===== DS4_WORKLOAD ";
+    char *p = cursor;
+    while ((p = strstr(p, marker)) != NULL) {
+        if (p == base || p[-1] == '\n') return p;
+        p += sizeof(marker) - 1;
+    }
+    return NULL;
+}
+
+static void bench_workload_free(bench_workload *w) {
+    if (!w) return;
+    for (int i = 0; i < w->len; i++) {
+        free(w->v[i].id);
+        free(w->v[i].category);
+        free(w->v[i].source);
+        free(w->v[i].rendered);
+    }
+    free(w->v);
+    memset(w, 0, sizeof(*w));
+}
+
+static bool bench_workload_push(bench_workload *w,
+                                const char *id,
+                                const char *category,
+                                const char *source,
+                                const char *rendered,
+                                size_t rendered_len) {
+    if (w->len == w->cap) {
+        int next = w->cap ? w->cap * 2 : 32;
+        bench_workload_case *v = realloc(w->v, (size_t)next * sizeof(*v));
+        if (!v) return false;
+        w->v = v;
+        w->cap = next;
+    }
+    bench_workload_case c = {
+        .id = bench_strndup(id, strlen(id)),
+        .category = bench_strndup(category, strlen(category)),
+        .source = bench_strndup(source, strlen(source)),
+        .rendered = bench_strndup(rendered, rendered_len),
+    };
+    if (!c.id || !c.category || !c.source || !c.rendered) {
+        free(c.id);
+        free(c.category);
+        free(c.source);
+        free(c.rendered);
+        return false;
+    }
+    w->v[w->len++] = c;
+    return true;
+}
+
+static bool bench_workload_read(const char *path, bench_workload *out) {
+    char *data = read_file(path);
+    char *cursor = data;
+    char *marker = NULL;
+    while ((marker = bench_workload_marker(data, cursor)) != NULL) {
+        char *header_end = strchr(marker, '\n');
+        if (!header_end) {
+            fprintf(stderr, "ds4-bench: unterminated workload header in %s\n", path);
+            free(data);
+            bench_workload_free(out);
+            return false;
+        }
+        char header[512];
+        const size_t header_len = (size_t)(header_end - marker);
+        if (header_len >= sizeof(header)) {
+            fprintf(stderr, "ds4-bench: workload header is too long in %s\n", path);
+            free(data);
+            bench_workload_free(out);
+            return false;
+        }
+        memcpy(header, marker, header_len);
+        header[header_len] = '\0';
+        char id[128], category[64], source[64];
+        if (sscanf(header,
+                   "===== DS4_WORKLOAD %127s %63s %63s =====",
+                   id,
+                   category,
+                   source) != 3) {
+            fprintf(stderr, "ds4-bench: invalid workload header: %s\n", header);
+            free(data);
+            bench_workload_free(out);
+            return false;
+        }
+        char *body = header_end + 1;
+        char *next = bench_workload_marker(data, body);
+        char *end = next ? next : data + strlen(data);
+        while (end > body && isspace((unsigned char)end[-1])) end--;
+        if (end == body) {
+            fprintf(stderr, "ds4-bench: workload case %s has an empty prompt\n", id);
+            free(data);
+            bench_workload_free(out);
+            return false;
+        }
+        if (!bench_workload_push(out,
+                                 id,
+                                 category,
+                                 source,
+                                 body,
+                                 (size_t)(end - body))) {
+            fprintf(stderr, "ds4-bench: out of memory reading workload\n");
+            free(data);
+            bench_workload_free(out);
+            return false;
+        }
+        if (!next) break;
+        cursor = next;
+    }
+    free(data);
+    if (out->len == 0) {
+        fprintf(stderr, "ds4-bench: no DS4_WORKLOAD records in %s\n", path);
+        return false;
+    }
+    return true;
+}
+
 static bench_config parse_options(int argc, char **argv) {
     bench_config c = {
         .model_path = "ds4flash.gguf",
@@ -240,6 +384,8 @@ static bench_config parse_options(int argc, char **argv) {
             c.prompt_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--chat-prompt-file")) {
             c.chat_prompt_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--workload-file")) {
+            c.workload_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-sys") || !strcmp(arg, "--system")) {
             c.system = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--ctx-start")) {
@@ -254,6 +400,15 @@ static bench_config parse_options(int argc, char **argv) {
             c.step_mul = parse_double_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--gen-tokens") || !strcmp(arg, "--tokens") || !strcmp(arg, "-n")) {
             c.gen_tokens = parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--workload-limit")) {
+            c.workload_limit = parse_nonnegative_int(
+                need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--workload-warmup")) {
+            c.workload_warmup = parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--workload-cold")) {
+            c.workload_cold = true;
+        } else if (!strcmp(arg, "--workload-detailed-expert-timing")) {
+            c.workload_detailed_expert_timing = true;
         } else if (!strcmp(arg, "--csv")) {
             c.csv_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dump-frontier-logits-dir")) {
@@ -335,8 +490,31 @@ static bench_config parse_options(int argc, char **argv) {
         }
     }
 
-    if (!!c.prompt_path == !!c.chat_prompt_path) {
-        fprintf(stderr, "ds4-bench: specify exactly one of --prompt-file or --chat-prompt-file\n");
+    const int input_count = !!c.prompt_path + !!c.chat_prompt_path + !!c.workload_path;
+    if (input_count != 1) {
+        fprintf(stderr,
+                "ds4-bench: specify exactly one of --prompt-file, --chat-prompt-file, or --workload-file\n");
+        exit(2);
+    }
+    if (c.workload_cold && c.workload_warmup > 0) {
+        fprintf(stderr,
+                "ds4-bench: --workload-warmup cannot be combined with --workload-cold\n");
+        exit(2);
+    }
+    if (c.workload_cold && !c.ssd_streaming) {
+        fprintf(stderr,
+                "ds4-bench: --workload-cold requires --ssd-streaming\n");
+        exit(2);
+    }
+    if (c.workload_detailed_expert_timing && !c.workload_path) {
+        fprintf(stderr,
+                "ds4-bench: --workload-detailed-expert-timing requires --workload-file\n");
+        exit(2);
+    }
+    if (c.workload_detailed_expert_timing &&
+        (!c.ssd_streaming || c.backend != DS4_BACKEND_METAL)) {
+        fprintf(stderr,
+                "ds4-bench: --workload-detailed-expert-timing requires Metal SSD streaming\n");
         exit(2);
     }
     if (c.ctx_start > c.ctx_max) {
@@ -355,10 +533,14 @@ static bench_config parse_options(int argc, char **argv) {
         fprintf(stderr, "ds4-bench: requested context is too large\n");
         exit(2);
     }
-    if (c.ctx_alloc == 0) c.ctx_alloc = c.ctx_max + c.gen_tokens + 1;
-    if (c.ctx_alloc <= c.ctx_max + c.gen_tokens) {
-        fprintf(stderr, "ds4-bench: --ctx-alloc must be greater than ctx-max + gen-tokens\n");
-        exit(2);
+    if (c.workload_path) {
+        if (c.ctx_alloc == 0) c.ctx_alloc = c.ctx_max;
+    } else {
+        if (c.ctx_alloc == 0) c.ctx_alloc = c.ctx_max + c.gen_tokens + 1;
+        if (c.ctx_alloc <= c.ctx_max + c.gen_tokens) {
+            fprintf(stderr, "ds4-bench: --ctx-alloc must be greater than ctx-max + gen-tokens\n");
+            exit(2);
+        }
     }
     char dist_err[256];
     if (ds4_dist_prepare_engine_options(&c.dist, NULL, dist_err, sizeof(dist_err)) != 0) {
@@ -551,8 +733,466 @@ static void maybe_warn_distributed_step_shape(const bench_config *cfg, ds4_sessi
     }
 }
 
+static uint64_t bench_delta_u64(uint64_t after, uint64_t before) {
+    return after >= before ? after - before : after;
+}
+
+static double bench_delta_f64(double after, double before) {
+    return after >= before ? after - before : after;
+}
+
+static ds4_expert_cache_stats bench_expert_stats_delta(
+        ds4_expert_cache_stats after,
+        ds4_expert_cache_stats before) {
+    return (ds4_expert_cache_stats) {
+        .hits = bench_delta_u64(after.hits, before.hits),
+        .misses = bench_delta_u64(after.misses, before.misses),
+        .evictions = bench_delta_u64(after.evictions, before.evictions),
+        .pread_bytes = bench_delta_u64(after.pread_bytes, before.pread_bytes),
+        .pread_ms = bench_delta_f64(after.pread_ms, before.pread_ms),
+        .selected_calls = bench_delta_u64(after.selected_calls,
+                                          before.selected_calls),
+        .cache_all_resident_layers =
+            bench_delta_u64(after.cache_all_resident_layers,
+                            before.cache_all_resident_layers),
+        .cache_all_missing_layers =
+            bench_delta_u64(after.cache_all_missing_layers,
+                            before.cache_all_missing_layers),
+        .cache_mixed_layers = bench_delta_u64(after.cache_mixed_layers,
+                                              before.cache_mixed_layers),
+        .cache_resident_experts =
+            bench_delta_u64(after.cache_resident_experts,
+                            before.cache_resident_experts),
+        .cache_missing_experts =
+            bench_delta_u64(after.cache_missing_experts,
+                            before.cache_missing_experts),
+        .selected_bind_ms = bench_delta_f64(after.selected_bind_ms,
+                                            before.selected_bind_ms),
+        .missing_wait_ms = bench_delta_f64(after.missing_wait_ms,
+                                           before.missing_wait_ms),
+        .load_pread_ms = bench_delta_f64(after.load_pread_ms,
+                                         before.load_pread_ms),
+        .resident_experts = after.resident_experts,
+        .budget_experts = after.budget_experts,
+    };
+}
+
+static double bench_expert_hit_rate(ds4_expert_cache_stats s) {
+    const uint64_t lookups = s.hits + s.misses;
+    return lookups ? (double)s.hits / (double)lookups : 0.0;
+}
+
+static int bench_double_cmp(const void *a, const void *b) {
+    const double da = *(const double *)a;
+    const double db = *(const double *)b;
+    return (da > db) - (da < db);
+}
+
+static double bench_percentile_ms(const double *values, int n, double q) {
+    if (!values || n <= 0) return 0.0;
+    double *copy = malloc((size_t)n * sizeof(*copy));
+    if (!copy) return 0.0;
+    memcpy(copy, values, (size_t)n * sizeof(*copy));
+    qsort(copy, (size_t)n, sizeof(*copy), bench_double_cmp);
+    const double rank = q * (double)(n - 1);
+    const int lo = (int)floor(rank);
+    const int hi = (int)ceil(rank);
+    const double frac = rank - (double)lo;
+    const double result = copy[lo] + (copy[hi] - copy[lo]) * frac;
+    free(copy);
+    return result * 1000.0;
+}
+
+static int run_workload_benchmark(const bench_config *cfg, ds4_engine *engine) {
+    bench_workload workload = {0};
+    if (!bench_workload_read(cfg->workload_path, &workload)) return 1;
+
+    FILE *out = stdout;
+    if (cfg->csv_path) {
+        out = fopen(cfg->csv_path, "wb");
+        if (!out) {
+            fprintf(stderr,
+                    "ds4-bench: failed to open %s: %s\n",
+                    cfg->csv_path,
+                    strerror(errno));
+            bench_workload_free(&workload);
+            return 1;
+        }
+    }
+    fprintf(out,
+            "case_id,category,source,cache_mode,prompt_tokens,output_tokens,stop_reason,"
+            "ttft_ms,prefill_tps,decode_steps,decode_step_tps,inter_token_tps,"
+            "first_decode_ms,decode_p50_ms,decode_p95_ms,total_ms,"
+            "prefill_cache_hits,prefill_cache_misses,prefill_cache_hit_rate,"
+            "prefill_evictions,prefill_pread_mib,prefill_pread_ms,"
+            "decode_cache_hits,decode_cache_misses,decode_cache_hit_rate,"
+            "decode_evictions,decode_pread_mib,decode_pread_ms,"
+            "detailed_timing,"
+            "prefill_selected_calls,prefill_all_resident_layers,"
+            "prefill_mixed_layers,prefill_all_missing_layers,"
+            "prefill_resident_experts,prefill_missing_experts,"
+            "prefill_missing_experts_per_token,prefill_missing_wait_ms,"
+            "prefill_selected_bind_ms,prefill_load_pread_ms,"
+            "decode_selected_calls,decode_all_resident_layers,"
+            "decode_mixed_layers,decode_all_missing_layers,"
+            "decode_resident_experts,decode_missing_experts,"
+            "decode_missing_experts_per_step,decode_missing_wait_ms,"
+            "decode_selected_bind_ms,decode_load_pread_ms,"
+            "resident_experts,cache_budget_experts\n");
+    fflush(out);
+
+    const int eos = ds4_token_eos(engine);
+    const int warmup_cases = cfg->workload_warmup < workload.len
+        ? cfg->workload_warmup : workload.len;
+    const int available_cases = workload.len - warmup_cases;
+    const int measured_cases = cfg->workload_limit > 0 &&
+                               cfg->workload_limit < available_cases
+        ? cfg->workload_limit : available_cases;
+    const int case_limit = warmup_cases + measured_cases;
+    uint64_t total_prompt_tokens = 0;
+    uint64_t total_output_tokens = 0;
+    uint64_t total_decode_steps = 0;
+    double total_prefill_sec = 0.0;
+    double total_decode_sec = 0.0;
+    ds4_expert_cache_stats total_prefill_stats = {0};
+    ds4_expert_cache_stats total_decode_stats = {0};
+    int completed = 0;
+    int rc = 0;
+
+    for (int ci = 0; ci < case_limit; ci++) {
+        bench_workload_case *wc = &workload.v[ci];
+        const bool measured = ci >= warmup_cases;
+        if (cfg->workload_cold &&
+            ds4_engine_expert_cache_clear_for_benchmark(engine) != 0) {
+            fprintf(stderr,
+                    "ds4-bench: failed to clear expert cache before case %s\n",
+                    wc->id);
+            rc = 1;
+            break;
+        }
+
+        ds4_tokens prompt = {0};
+        ds4_tokenize_rendered_chat(engine, wc->rendered, &prompt);
+        const int output_room = cfg->ctx_alloc - prompt.len - 1;
+        if (prompt.len <= 0 || output_room <= 0) {
+            fprintf(stderr,
+                    "ds4-bench: skip workload case %s: prompt_tokens=%d ctx=%d\n",
+                    wc->id,
+                    prompt.len,
+                    cfg->ctx_alloc);
+            ds4_tokens_free(&prompt);
+            continue;
+        }
+        const int output_limit = cfg->gen_tokens < output_room
+            ? cfg->gen_tokens : output_room;
+
+        ds4_session *session = NULL;
+        if (ds4_session_create(&session, engine, cfg->ctx_alloc) != 0) {
+            fprintf(stderr,
+                    "ds4-bench: failed to create session for case %s\n",
+                    wc->id);
+            ds4_tokens_free(&prompt);
+            rc = 1;
+            break;
+        }
+        if (cfg->dist.role == DS4_DISTRIBUTED_COORDINATOR &&
+            wait_distributed_route(session) != 0) {
+            ds4_session_free(session);
+            ds4_tokens_free(&prompt);
+            rc = 1;
+            break;
+        }
+
+        ds4_expert_cache_stats stats0 = {0}, stats_prefill = {0}, stats_decode = {0};
+        ds4_engine_expert_cache_stats(engine, &stats0);
+        char err[256];
+        const double request_t0 = bench_now_sec();
+        if (ds4_session_sync(session, &prompt, err, sizeof(err)) != 0) {
+            fprintf(stderr,
+                    "ds4-bench: workload prefill failed for %s: %s\n",
+                    wc->id,
+                    err);
+            ds4_session_free(session);
+            ds4_tokens_free(&prompt);
+            rc = 1;
+            break;
+        }
+        const double prefill_t1 = bench_now_sec();
+        ds4_engine_expert_cache_stats(engine, &stats_prefill);
+
+        double *decode_latencies = output_limit > 1
+            ? calloc((size_t)(output_limit - 1), sizeof(*decode_latencies)) : NULL;
+        if (output_limit > 1 && !decode_latencies) {
+            fprintf(stderr,
+                    "ds4-bench: out of memory recording decode latency for %s\n",
+                    wc->id);
+            ds4_session_free(session);
+            ds4_tokens_free(&prompt);
+            rc = 1;
+            break;
+        }
+        int *output_ids = cfg->show_output && output_limit > 0
+            ? malloc((size_t)output_limit * sizeof(*output_ids)) : NULL;
+        int output_tokens = 0;
+        int decode_steps = 0;
+        double decode_sec = 0.0;
+        double inter_token_sec = 0.0;
+        double first_decode_sec = 0.0;
+        double pending_eval_sec = 0.0;
+        const char *stop_reason = output_limit == 0 ? "max_tokens" : "max_tokens";
+        double ttft_sec = 0.0;
+
+        while (output_tokens < output_limit) {
+            const int token = ds4_session_argmax(session);
+            if (output_tokens == 0) ttft_sec = bench_now_sec() - request_t0;
+            if (token < 0) {
+                fprintf(stderr,
+                        "ds4-bench: failed to sample workload case %s\n",
+                        wc->id);
+                rc = 1;
+                break;
+            }
+            if (token == eos) {
+                stop_reason = "eos";
+                break;
+            }
+            if (output_tokens > 0) inter_token_sec += pending_eval_sec;
+            if (output_ids) output_ids[output_tokens] = token;
+            output_tokens++;
+            if (output_tokens >= output_limit) break;
+
+            const double token_t0 = bench_now_sec();
+            if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
+                fprintf(stderr,
+                        "ds4-bench: workload decode failed for %s: %s\n",
+                        wc->id,
+                        err);
+                rc = 1;
+                break;
+            }
+            pending_eval_sec = bench_now_sec() - token_t0;
+            decode_latencies[decode_steps] = pending_eval_sec;
+            if (decode_steps == 0) first_decode_sec = pending_eval_sec;
+            decode_sec += pending_eval_sec;
+            decode_steps++;
+        }
+        const double request_t1 = bench_now_sec();
+        ds4_engine_expert_cache_stats(engine, &stats_decode);
+
+        if (cfg->show_output && output_ids && output_tokens > 0) {
+            fprintf(stderr, "ds4-bench: workload[%s] output: \"", wc->id);
+            for (int i = 0; i < output_tokens; i++) {
+                size_t len = 0;
+                char *text = ds4_token_text(engine, output_ids[i], &len);
+                if (text) {
+                    fwrite(text, 1, len, stderr);
+                    free(text);
+                }
+            }
+            fprintf(stderr, "\"\n");
+        }
+
+        if (rc != 0) {
+            free(output_ids);
+            free(decode_latencies);
+            ds4_session_free(session);
+            ds4_tokens_free(&prompt);
+            break;
+        }
+
+        const double prefill_sec = prefill_t1 - request_t0;
+        const ds4_expert_cache_stats prefill_delta =
+            bench_expert_stats_delta(stats_prefill, stats0);
+        const ds4_expert_cache_stats decode_delta =
+            bench_expert_stats_delta(stats_decode, stats_prefill);
+        const double p50_ms = bench_percentile_ms(decode_latencies,
+                                                   decode_steps,
+                                                   0.50);
+        const double p95_ms = bench_percentile_ms(decode_latencies,
+                                                   decode_steps,
+                                                   0.95);
+        if (measured) {
+            fprintf(out,
+                "%s,%s,%s,%s,%d,%d,%s,%.3f,%.2f,%d,%.2f,%.2f,%.3f,%.3f,%.3f,%.3f,"
+                "%llu,%llu,%.6f,%llu,%.3f,%.3f,"
+                "%llu,%llu,%.6f,%llu,%.3f,%.3f,",
+                wc->id,
+                wc->category,
+                wc->source,
+                cfg->workload_cold ? "cold" : "warm",
+                prompt.len,
+                output_tokens,
+                stop_reason,
+                ttft_sec * 1000.0,
+                prefill_sec > 0.0 ? (double)prompt.len / prefill_sec : 0.0,
+                decode_steps,
+                decode_sec > 0.0 ? (double)decode_steps / decode_sec : 0.0,
+                inter_token_sec > 0.0 && output_tokens > 1
+                    ? (double)(output_tokens - 1) / inter_token_sec : 0.0,
+                first_decode_sec * 1000.0,
+                p50_ms,
+                p95_ms,
+                (request_t1 - request_t0) * 1000.0,
+                (unsigned long long)prefill_delta.hits,
+                (unsigned long long)prefill_delta.misses,
+                bench_expert_hit_rate(prefill_delta),
+                (unsigned long long)prefill_delta.evictions,
+                (double)prefill_delta.pread_bytes / (1024.0 * 1024.0),
+                prefill_delta.pread_ms,
+                (unsigned long long)decode_delta.hits,
+                (unsigned long long)decode_delta.misses,
+                bench_expert_hit_rate(decode_delta),
+                (unsigned long long)decode_delta.evictions,
+                (double)decode_delta.pread_bytes / (1024.0 * 1024.0),
+                decode_delta.pread_ms);
+            fprintf(out,
+                "%d,%llu,%llu,%llu,%llu,%llu,%llu,%.6f,%.3f,%.3f,%.3f,"
+                "%llu,%llu,%llu,%llu,%llu,%llu,%.6f,%.3f,%.3f,%.3f,%u,%u\n",
+                cfg->workload_detailed_expert_timing ? 1 : 0,
+                (unsigned long long)prefill_delta.selected_calls,
+                (unsigned long long)prefill_delta.cache_all_resident_layers,
+                (unsigned long long)prefill_delta.cache_mixed_layers,
+                (unsigned long long)prefill_delta.cache_all_missing_layers,
+                (unsigned long long)prefill_delta.cache_resident_experts,
+                (unsigned long long)prefill_delta.cache_missing_experts,
+                prompt.len > 0
+                    ? (double)prefill_delta.cache_missing_experts / prompt.len
+                    : 0.0,
+                prefill_delta.missing_wait_ms,
+                prefill_delta.selected_bind_ms,
+                prefill_delta.load_pread_ms,
+                (unsigned long long)decode_delta.selected_calls,
+                (unsigned long long)decode_delta.cache_all_resident_layers,
+                (unsigned long long)decode_delta.cache_mixed_layers,
+                (unsigned long long)decode_delta.cache_all_missing_layers,
+                (unsigned long long)decode_delta.cache_resident_experts,
+                (unsigned long long)decode_delta.cache_missing_experts,
+                decode_steps > 0
+                    ? (double)decode_delta.cache_missing_experts / decode_steps
+                    : 0.0,
+                decode_delta.missing_wait_ms,
+                decode_delta.selected_bind_ms,
+                decode_delta.load_pread_ms,
+                stats_decode.resident_experts,
+                stats_decode.budget_experts);
+            fflush(out);
+        }
+
+        if (measured) {
+            total_prompt_tokens += (uint64_t)prompt.len;
+            total_output_tokens += (uint64_t)output_tokens;
+            total_decode_steps += (uint64_t)decode_steps;
+            total_prefill_sec += prefill_sec;
+            total_decode_sec += decode_sec;
+            total_prefill_stats.hits += prefill_delta.hits;
+            total_prefill_stats.misses += prefill_delta.misses;
+            total_prefill_stats.evictions += prefill_delta.evictions;
+            total_prefill_stats.pread_bytes += prefill_delta.pread_bytes;
+            total_prefill_stats.pread_ms += prefill_delta.pread_ms;
+            total_prefill_stats.selected_calls += prefill_delta.selected_calls;
+            total_prefill_stats.cache_all_resident_layers +=
+                prefill_delta.cache_all_resident_layers;
+            total_prefill_stats.cache_all_missing_layers +=
+                prefill_delta.cache_all_missing_layers;
+            total_prefill_stats.cache_mixed_layers +=
+                prefill_delta.cache_mixed_layers;
+            total_prefill_stats.cache_resident_experts +=
+                prefill_delta.cache_resident_experts;
+            total_prefill_stats.cache_missing_experts +=
+                prefill_delta.cache_missing_experts;
+            total_prefill_stats.selected_bind_ms +=
+                prefill_delta.selected_bind_ms;
+            total_prefill_stats.missing_wait_ms +=
+                prefill_delta.missing_wait_ms;
+            total_prefill_stats.load_pread_ms += prefill_delta.load_pread_ms;
+            total_decode_stats.hits += decode_delta.hits;
+            total_decode_stats.misses += decode_delta.misses;
+            total_decode_stats.evictions += decode_delta.evictions;
+            total_decode_stats.pread_bytes += decode_delta.pread_bytes;
+            total_decode_stats.pread_ms += decode_delta.pread_ms;
+            total_decode_stats.selected_calls += decode_delta.selected_calls;
+            total_decode_stats.cache_all_resident_layers +=
+                decode_delta.cache_all_resident_layers;
+            total_decode_stats.cache_all_missing_layers +=
+                decode_delta.cache_all_missing_layers;
+            total_decode_stats.cache_mixed_layers +=
+                decode_delta.cache_mixed_layers;
+            total_decode_stats.cache_resident_experts +=
+                decode_delta.cache_resident_experts;
+            total_decode_stats.cache_missing_experts +=
+                decode_delta.cache_missing_experts;
+            total_decode_stats.selected_bind_ms += decode_delta.selected_bind_ms;
+            total_decode_stats.missing_wait_ms += decode_delta.missing_wait_ms;
+            total_decode_stats.load_pread_ms += decode_delta.load_pread_ms;
+            completed++;
+        } else {
+            fprintf(stderr,
+                    "ds4-bench: workload warmup %d/%d case=%s prompt=%d output=%d\n",
+                    ci + 1,
+                    warmup_cases,
+                    wc->id,
+                    prompt.len,
+                    output_tokens);
+        }
+
+        free(output_ids);
+        free(decode_latencies);
+        ds4_session_free(session);
+        ds4_tokens_free(&prompt);
+    }
+
+    fprintf(stderr,
+            "ds4-bench: workload summary mode=%s cases=%d prompt_tokens=%llu "
+            "output_tokens=%llu prefill_tps=%.2f decode_steps=%llu decode_tps=%.2f "
+            "prefill_hit_rate=%.4f decode_hit_rate=%.4f prefill_pread=%.2f GiB "
+            "decode_pread=%.2f GiB\n",
+            cfg->workload_cold ? "cold" : "warm",
+            completed,
+            (unsigned long long)total_prompt_tokens,
+            (unsigned long long)total_output_tokens,
+            total_prefill_sec > 0.0
+                ? (double)total_prompt_tokens / total_prefill_sec : 0.0,
+            (unsigned long long)total_decode_steps,
+            total_decode_sec > 0.0
+                ? (double)total_decode_steps / total_decode_sec : 0.0,
+            bench_expert_hit_rate(total_prefill_stats),
+            bench_expert_hit_rate(total_decode_stats),
+            (double)total_prefill_stats.pread_bytes / (1024.0 * 1024.0 * 1024.0),
+            (double)total_decode_stats.pread_bytes / (1024.0 * 1024.0 * 1024.0));
+
+    if (cfg->workload_detailed_expert_timing) {
+        fprintf(stderr,
+                "ds4-bench: detailed expert timing (intrusive) "
+                "prefill_missing_per_token=%.3f prefill_wait=%.3f ms "
+                "decode_missing_per_step=%.3f decode_wait=%.3f ms "
+                "decode_bind=%.3f ms decode_load_pread=%.3f ms\n",
+                total_prompt_tokens > 0
+                    ? (double)total_prefill_stats.cache_missing_experts /
+                        (double)total_prompt_tokens : 0.0,
+                total_prefill_stats.missing_wait_ms,
+                total_decode_steps > 0
+                    ? (double)total_decode_stats.cache_missing_experts /
+                        (double)total_decode_steps : 0.0,
+                total_decode_stats.missing_wait_ms,
+                total_decode_stats.selected_bind_ms,
+                total_decode_stats.load_pread_ms);
+    }
+
+    if (out != stdout) fclose(out);
+    bench_workload_free(&workload);
+    return rc;
+}
+
 int main(int argc, char **argv) {
     bench_config cfg = parse_options(argc, argv);
+
+    if (cfg.workload_detailed_expert_timing &&
+        setenv("DS4_METAL_STREAMING_EXPERT_TIMING_SUMMARY", "1", 1) != 0) {
+        fprintf(stderr,
+                "ds4-bench: failed to enable detailed expert timing: %s\n",
+                strerror(errno));
+        return 2;
+    }
 
     /* Hint the packer at the largest ctx this bench run will exercise
      * so per-layer KV bytes are priced for the real session size, not
@@ -620,6 +1260,12 @@ int main(int argc, char **argv) {
                        cfg.ctx_alloc,
                        ds4_engine_prefill_chunk(engine),
                        cfg.ssd_streaming);
+
+    if (cfg.workload_path) {
+        const int workload_rc = run_workload_benchmark(&cfg, engine);
+        ds4_engine_close(engine);
+        return workload_rc;
+    }
 
     char *text = read_file(cfg.prompt_path ? cfg.prompt_path : cfg.chat_prompt_path);
     ds4_tokens prompt = {0};
