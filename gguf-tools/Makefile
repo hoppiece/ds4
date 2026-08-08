@@ -48,6 +48,9 @@ all: deepseek4-quantize
 deepseek4-quantize: deepseek4-quantize.c quants.c quants.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ deepseek4-quantize.c quants.c -lm -pthread
 
+expert-major-probe: expert-major-probe.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ expert-major-probe.c -pthread
+
 quality-score:
 	$(MAKE) -C .. $(QUALITY_TARGETS)
 	$(QUALITY_LINK) quality-testing/score_official quality-testing/score_official.c $(QUALITY_OBJS) $(QUALITY_LDLIBS)
@@ -56,4 +59,4 @@ quality-llama-score:
 	$(CXX) $(LLAMA_CPP_CXXFLAGS) -o quality-testing/score_llama quality-testing/score_llama.cpp $(LLAMA_CPP_LDLIBS)
 
 clean:
-	rm -f deepseek4-quantize quality-testing/score_official quality-testing/score_llama
+	rm -f deepseek4-quantize expert-major-probe quality-testing/score_official quality-testing/score_llama
