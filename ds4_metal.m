@@ -10544,6 +10544,41 @@ uint32_t ds4_gpu_stream_expert_cache_current_count(void) {
     return g_stream_expert_cache_entry_count;
 }
 
+void ds4_gpu_stream_expert_cache_get_stats(
+        ds4_gpu_stream_expert_stats *out) {
+    if (!out) return;
+    *out = (ds4_gpu_stream_expert_stats) {
+        .hits = g_stream_expert_cache_hits,
+        .misses = g_stream_expert_cache_misses,
+        .evictions = g_stream_expert_cache_evictions,
+        .pread_bytes = g_stream_expert_cache_pread_bytes,
+        .pread_ms = g_stream_expert_cache_pread_ms,
+        .selected_calls = g_stream_expert_timing_selected_calls,
+        .cache_all_resident_layers =
+            g_stream_expert_timing_cache_all_resident_layers,
+        .cache_all_missing_layers =
+            g_stream_expert_timing_cache_all_missing_layers,
+        .cache_mixed_layers = g_stream_expert_timing_cache_mixed_layers,
+        .cache_resident_experts =
+            g_stream_expert_timing_cache_resident_experts,
+        .cache_missing_experts =
+            g_stream_expert_timing_cache_missing_experts,
+        .selected_bind_ms = g_stream_expert_timing_selected_bind_ms,
+        .missing_load_ms = g_stream_expert_timing_split_missing_load_ms,
+        .missing_wait_ms = g_stream_expert_timing_split_missing_wait_ms,
+        .load_pread_ms = g_stream_expert_timing_load_pread_ms,
+        .resident_experts = g_stream_expert_cache_entry_count,
+        .budget_experts = ds4_gpu_stream_expert_cache_configured_count(),
+    };
+}
+
+int ds4_gpu_stream_expert_cache_clear_for_benchmark(void) {
+    if (!g_ssd_streaming_mode) return 0;
+    if (!ds4_gpu_synchronize()) return 0;
+    ds4_gpu_stream_expert_cache_clear_all(1);
+    return 1;
+}
+
 uint32_t ds4_gpu_stream_expert_cache_budget_for_expert_size(
         uint64_t gate_expert_bytes,
         uint64_t down_expert_bytes) {

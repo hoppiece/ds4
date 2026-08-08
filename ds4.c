@@ -57065,6 +57065,48 @@ int ds4_engine_layer_count(ds4_engine *e) {
     return (int)DS4_N_LAYER;
 }
 
+bool ds4_engine_expert_cache_stats(ds4_engine *e,
+                                   ds4_expert_cache_stats *out) {
+    if (!out) return false;
+    memset(out, 0, sizeof(*out));
+#ifdef DS4_NO_GPU
+    (void)e;
+    return false;
+#else
+    if (!e || e->backend == DS4_BACKEND_CPU || !e->ssd_streaming) return false;
+    ds4_gpu_stream_expert_stats gpu = {0};
+    ds4_gpu_stream_expert_cache_get_stats(&gpu);
+    out->hits = gpu.hits;
+    out->misses = gpu.misses;
+    out->evictions = gpu.evictions;
+    out->pread_bytes = gpu.pread_bytes;
+    out->pread_ms = gpu.pread_ms;
+    out->selected_calls = gpu.selected_calls;
+    out->cache_all_resident_layers = gpu.cache_all_resident_layers;
+    out->cache_all_missing_layers = gpu.cache_all_missing_layers;
+    out->cache_mixed_layers = gpu.cache_mixed_layers;
+    out->cache_resident_experts = gpu.cache_resident_experts;
+    out->cache_missing_experts = gpu.cache_missing_experts;
+    out->selected_bind_ms = gpu.selected_bind_ms;
+    out->missing_load_ms = gpu.missing_load_ms;
+    out->missing_wait_ms = gpu.missing_wait_ms;
+    out->load_pread_ms = gpu.load_pread_ms;
+    out->resident_experts = gpu.resident_experts;
+    out->budget_experts = gpu.budget_experts;
+    return true;
+#endif
+}
+
+int ds4_engine_expert_cache_clear_for_benchmark(ds4_engine *e) {
+#ifdef DS4_NO_GPU
+    (void)e;
+    return 1;
+#else
+    if (!e || e->backend == DS4_BACKEND_CPU || !e->ssd_streaming) return 1;
+    return ds4_gpu_stream_expert_cache_clear_for_benchmark() ? 0 : 1;
+#endif
+}
+
 uint32_t ds4_engine_layer_compress_ratio(ds4_engine *e, uint32_t layer) {
     (void)e;
     if (layer >= DS4_N_LAYER) return 0;

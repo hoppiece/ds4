@@ -35,5 +35,6 @@
 __pycache__/
 *.pyc
 /misc/
+/workload-bench/data/
 .*.swp
 .DS_Store
