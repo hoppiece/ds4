@@ -4358,6 +4358,19 @@ static ds4_gpu_mv_dispatch ds4_gpu_make_q8_0_mv_dispatch(void) {
     };
 }
 
+static ds4_gpu_mv_dispatch ds4_gpu_make_q8_0_fixed_r2_dispatch(void) {
+    /* The default fused kernels are compiled with N_R0_Q8_0=2 and do not
+     * switch on args.nr0. Preserve the configured simdgroup count, but never
+     * let the generic rows=4 diagnostic alter their grid or row stride. */
+    const ds4_gpu_mv_dispatch configured = ds4_gpu_make_q8_0_mv_dispatch();
+    return (ds4_gpu_mv_dispatch) {
+        .function_name = "kernel_mul_mv_q8_0_f32",
+        .nsg = configured.nsg,
+        .nr0 = 2,
+        .smem = 32u * 2u * sizeof(float),
+    };
+}
+
 static ds4_gpu_mv_dispatch ds4_gpu_make_plain_mv_dispatch(
         uint64_t in_dim,
         int      f32_weights) {
@@ -17851,8 +17864,10 @@ int ds4_gpu_matmul_q8_0_pair_tensor(
                                      weight1_offset, weight1_bytes, &inner1);
         if (!weight0buf || !weight1buf) return 0;
 
-        ds4_gpu_mv_dispatch dispatch0 = ds4_gpu_make_q8_0_mv_dispatch();
-        ds4_gpu_mv_dispatch dispatch1 = ds4_gpu_make_q8_0_mv_dispatch();
+        ds4_gpu_mv_dispatch dispatch0 =
+            ds4_gpu_make_q8_0_fixed_r2_dispatch();
+        ds4_gpu_mv_dispatch dispatch1 =
+            ds4_gpu_make_q8_0_fixed_r2_dispatch();
         if (out0_dim > 65536u) dispatch0.nsg = 8;
         if (out1_dim > 65536u) dispatch1.nsg = 8;
         /* A common threadgroup shape is required to retain each standalone
@@ -40494,7 +40509,8 @@ int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
         if (!wbuf) return 0;
 
         ds4_gpu_q8_0_matvec_args mv_args = ds4_gpu_make_q8_0_mv_args(in_dim, out_dim);
-        ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_q8_0_mv_dispatch();
+        ds4_gpu_mv_dispatch mv_dispatch =
+            ds4_gpu_make_q8_0_fixed_r2_dispatch();
         mv_args.nr0 = mv_dispatch.nr0;
 
         ds4_gpu_hc_expand_args hc_args = {
@@ -40610,7 +40626,8 @@ int ds4_gpu_matmul_q8_0_hc_expand_tensor(
         if (!wbuf) return 0;
 
         ds4_gpu_q8_0_matvec_args mv_args = ds4_gpu_make_q8_0_mv_args(in_dim, out_dim);
-        ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_q8_0_mv_dispatch();
+        ds4_gpu_mv_dispatch mv_dispatch =
+            ds4_gpu_make_q8_0_fixed_r2_dispatch();
         mv_args.nr0 = mv_dispatch.nr0;
 
         ds4_gpu_hc_expand_args hc_args = {
